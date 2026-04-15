@@ -1,0 +1,32 @@
+model:
+  name: google/gemma-4-E4B-it
+  torch_dtype: bfloat16
+  device_map: auto
+  quantize: null  # null | 4bit | 8bit
+  target_layer: null  # null = auto (2/3 of num_layers)
+  all_layers: false
+
+generation:
+  stories_per_topic: 12
+  topics_subset: null  # null = all 100
+  emotions_subset: null  # null = all 171
+  batch_size: 4
+  max_new_tokens: 2048
+  temperature: 0.8
+  neutral_dialogues_per_topic: 12
+
+activation:
+  token_offset: 50
+  batch_size: 8
+  storage_format: safetensors
+
+analysis:
+  pca_variance_threshold: 0.5
+  kmeans_k: 10
+  logit_lens_top_k: 10
+  umap_n_neighbors: 15
+  umap_min_dist: 0.1
+
+output_dir: output
+cache_dir: output/cache
+seed: 42

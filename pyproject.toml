@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emotion-probes"
+version = "0.1.0"
+description = "Generate emotion probes for open-source language models"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Vishram Urs"}]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.45",
+    "safetensors>=0.4",
+    "accelerate>=0.30",
+    "click>=8.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "umap-learn>=0.5",
+    "tqdm>=4.66",
+    "psutil>=5.8",
+]
+
+[project.optional-dependencies]
+quantize = ["bitsandbytes>=0.43"]
+dev = ["pytest>=8.0", "pytest-cov", "ruff"]
+notebook = ["jupyter", "ipywidgets"]
+
+[project.urls]
+Repository = "https://github.com/V-Coding/emotion-probes"
+
+[project.scripts]
+emotion-probes = "emotion_probes.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires GPU"]

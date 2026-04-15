@@ -1,0 +1,44 @@
+# Medium config: 20 curated emotions covering valence × arousal space.
+# 20 emotions x 100 topics x 12 stories = 24,000 stories (2,000 prompts).
+# ~4 hrs on A100 80GB with a 3B model, ~6.5 hrs with 8B.
+#
+# Emotion selection covers all four quadrants:
+#   High valence, high arousal: excited, triumphant, loving
+#   High valence, low arousal:  calm, content, grateful, nostalgic
+#   Low valence, high arousal:  afraid, angry, desperate, anxious, disgusted, jealous
+#   Low valence, low arousal:   sad, lonely, guilty
+#   Mixed / neutral arousal:    happy, hopeful, proud, surprised
+
+model:
+  name: google/gemma-4-E4B-it
+  torch_dtype: bfloat16
+  device_map: auto
+  quantize: null
+  target_layer: null
+  all_layers: false
+
+generation:
+  stories_per_topic: 12
+  topics_subset: null    # all 100 topics
+  emotions_subset: null  # ignored — using emotions_file override
+  batch_size: 4
+  max_new_tokens: 2048
+  temperature: 0.8
+  neutral_dialogues_per_topic: 12
+
+activation:
+  token_offset: 50
+  batch_size: 8
+  storage_format: safetensors
+
+analysis:
+  pca_variance_threshold: 0.5
+  kmeans_k: 5
+  logit_lens_top_k: 10
+  umap_n_neighbors: 10
+  umap_min_dist: 0.1
+
+emotions_file: emotions_20.txt
+output_dir: output
+cache_dir: output/cache
+seed: 42
