@@ -1,0 +1,39 @@
+# DeepSWE-Preview probe-build config. Paths are resolved relative to this file
+# (for emotions_file/topics_file) and relative to the CWD from which the
+# `emotion-probes` CLI is invoked (for output_dir/cache_dir). The scripts in
+# ../scripts/ `cd` into the experiment folder before running, so output_dir
+# below lands at experiment/swebench_coding_emotions/output/probes.
+
+model:
+  name: agentica-org/DeepSWE-Preview
+  torch_dtype: bfloat16
+  device_map: auto
+  quantize: 4bit        # set to null if you have >=2x80GB GPUs
+  target_layer: 42      # ~2/3 of 64 layers
+  all_layers: false
+
+generation:
+  stories_per_topic: 4
+  topics_subset: 40
+  emotions_subset: null
+  batch_size: 1
+  max_new_tokens: 1024
+  temperature: 0.8
+  neutral_dialogues_per_topic: 6
+
+activation:
+  token_offset: 50
+  batch_size: 2
+  storage_format: safetensors
+
+analysis:
+  pca_variance_threshold: 0.5
+  kmeans_k: 5
+  logit_lens_top_k: 10
+  umap_n_neighbors: 8
+  umap_min_dist: 0.1
+
+emotions_file: emotions_coding.txt
+output_dir: output/probes
+cache_dir: output/probes/cache
+seed: 42
