@@ -40,6 +40,12 @@ def test_augmented_neutral_texts_cover_each_structural_surface():
     assert "diff --git" in blob
     assert "<think>" in blob
     assert "</think>" in blob
+    # Traceback / pytest / shell-output surfaces (added after the methodology
+    # review flagged them as common in agent trajectories but absent here).
+    assert "Traceback (most recent call last):" in blob
+    assert "AssertionError" in blob
+    assert "pytest" in blob
+    assert "$ ls" in blob
 
 
 def test_augmented_neutral_texts_have_no_overt_emotion_words():

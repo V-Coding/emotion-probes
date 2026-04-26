@@ -209,3 +209,59 @@ def test_load_probes_missing_augmented_file_raises(tmp_path: Path):
     (tmp_path / "activations").mkdir()
     with _pytest.raises(FileNotFoundError, match="augment"):
         RP.load_probes(tmp_path, layer=1, variant="augmented")
+
+
+def test_load_probes_raw_variant_layer_mismatch_raises(tmp_path: Path):
+    """The raw branch should refuse files whose metadata claims a
+    different layer than was requested."""
+    import json as _json
+    import pytest as _pytest
+    from emotion_probes.data import save_tensors as _save
+
+    (tmp_path / "vectors").mkdir()
+    (tmp_path / "activations").mkdir()
+    _save(
+        {"raw_vectors": np.zeros((2, 3), dtype=np.float32)},
+        tmp_path / "vectors" / "raw_vectors_layer_5.safetensors",
+        metadata={"layer": "5", "emotions": _json.dumps(["a", "b"])},
+    )
+    _save(
+        {"global_mean": np.zeros(3, dtype=np.float32)},
+        tmp_path / "activations" / "global_mean_layer_5.safetensors",
+    )
+    # Sanity: matching layer loads cleanly.
+    v, _, _ = RP.load_probes(tmp_path, layer=5, variant="raw")
+    assert v.shape == (2, 3)
+    # Tamper: write a file at layer 7 whose metadata claims it's layer 5.
+    _save(
+        {"raw_vectors": np.zeros((2, 3), dtype=np.float32)},
+        tmp_path / "vectors" / "raw_vectors_layer_7.safetensors",
+        metadata={"layer": "5", "emotions": _json.dumps(["a", "b"])},
+    )
+    _save(
+        {"global_mean": np.zeros(3, dtype=np.float32)},
+        tmp_path / "activations" / "global_mean_layer_7.safetensors",
+    )
+    with _pytest.raises(ValueError, match="Layer mismatch"):
+        RP.load_probes(tmp_path, layer=7, variant="raw")
+
+
+def test_read_replay_variant_returns_none_for_missing_metadata(tmp_path: Path):
+    """`read_replay_variant` should return None for files without the
+    metadata field — used by the replay CLI to gate the variant-mismatch
+    refusal logic."""
+    from emotion_probes.data import save_tensors as _save
+    p = tmp_path / "old.safetensors"
+    _save(
+        {"scores": np.zeros((1, 1), dtype=np.float16)},
+        p,
+        metadata={"instance_id": "x"},
+    )
+    assert RP.read_replay_variant(p) is None
+
+
+def test_read_replay_variant_returns_metadata_value(tmp_path: Path):
+    result = _make_replay_result()
+    p = tmp_path / "demo.safetensors"
+    RP.save_replay(result, p)
+    assert RP.read_replay_variant(p) == "augmented"

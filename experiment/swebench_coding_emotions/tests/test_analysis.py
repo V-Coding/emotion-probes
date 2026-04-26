@@ -185,6 +185,40 @@ def test_aggregate_no_auc_column(tmp_path: Path):
     assert {"mean", "max", "p90", "n_kept", "n_tokens"}.issubset(df.columns)
 
 
+def test_run_full_analysis_records_empty_cells(tmp_path: Path, caplog):
+    """If a section has no kept tokens for some instance, summary.json must
+    list it under empty_section_cells and a WARNING must be logged. Without
+    this, downstream MW / OLS would silently compute on unequal sample sizes."""
+    import logging
+
+    T = 60
+    # Trajectory with no </think> => "thinking" section is empty.
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    _write_synthetic_replay(
+        replay_dir / "task_e.safetensors",
+        instance_id="task_e",
+        resolved=True,
+        difficulty="<15 min fix",
+        token_ids=np.full(T, 1, dtype=np.int32),
+        scores=np.full((T, 1), 1.0, dtype=np.float32),
+        emotions=["frustrated"],
+        special_token_ids=[],
+        thinking_end_char=-1,
+        patch_start_char=-1,
+    )
+    out_dir = tmp_path / "analysis"
+    with caplog.at_level(logging.WARNING, logger="swebench_coding_emotions.analysis"):
+        from swebench_coding_emotions import analysis as _A
+        _A.run_full_analysis(replay_dir, out_dir, token_offset=0)
+
+    summary = json.loads((out_dir / "summary.json").read_text())
+    cells = {(c["instance_id"], c["section"]) for c in summary["empty_section_cells"]}
+    assert ("task_e", "thinking") in cells
+    assert ("task_e", "patch") in cells
+    assert any("Aggregation produced no rows" in r.message for r in caplog.records)
+
+
 def test_aggregate_section_returns_empty_when_all_kept_tokens_filtered(tmp_path: Path):
     """If every token in a section is dropped (offset + specials), that
     (instance, section, emotion) row should simply be omitted rather than

@@ -66,9 +66,12 @@ bash scripts/05_visualize.sh
 
 - `output/probes/` — emotion direction vectors, global mean, cosine heatmap.
 - `output/swebench/raw/` — cached trajectories + pass/fail reports.
-- `output/swebench/replay/` — per-task probe scores (.safetensors).
-- `output/swebench/analysis/` — per_task.csv, stats.csv, summary.json.
-- `output/swebench/figures/` — timelines, box plots, heatmap, decile curves.
+- `output/swebench/replay/{variant}/` — per-task probe scores (.safetensors), one
+  subdirectory per probe variant (`denoised`, `augmented`, `raw`). The `replay`,
+  `analyze`, and `viz` subcommands all take `--variant` and read/write the matching
+  subtree, so multiple variants can coexist without clobbering each other.
+- `output/swebench/analysis/{variant}/` — per_task.csv, stats.csv, summary.json.
+- `output/swebench/figures/{variant}/` — timelines, box plots, heatmap, decile curves.
 
 ## Decisions
 
@@ -114,3 +117,14 @@ changing the emotion stimuli themselves:
    correlated with `mean`, and across tasks it is dominated by trajectory
    length, which correlates with pass/fail and would confound the
    group-comparison tests. `mean`, `max`, and `p90` remain.
+
+   Visualization (`viz.py`) intentionally applies only the *section* mask,
+   not this aggregation mask, so plots show the underlying per-token series
+   (useful for spotting probe spikes at template markers); statistics are
+   computed on the masked tokens.
+
+   `run_full_analysis` records any `(instance, section)` cells that ended
+   up empty after filtering, both as a `WARNING` log line and under
+   `summary.json["empty_section_cells"]`. This protects against
+   silently-unequal sample sizes per emotion in the Mann-Whitney / OLS
+   tests.

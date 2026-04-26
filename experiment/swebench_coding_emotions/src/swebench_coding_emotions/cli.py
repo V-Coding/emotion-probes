@@ -109,7 +109,7 @@ def replay(
     swebench_dir = _swebench_dir(config)
     sample_path = swebench_dir / "sample.json"
     raw_dir = swebench_dir / "raw"
-    out_dir = swebench_dir / "replay"
+    out_dir = swebench_dir / "replay" / variant
 
     if not sample_path.exists():
         click.echo(f"Error: no sample at {sample_path}. Run `swebench-emotions fetch` first.", err=True)
@@ -145,7 +145,16 @@ def replay(
         iid = rec["instance_id"]
         out_path = out_dir / f"{iid}.safetensors"
         if out_path.exists():
-            click.echo(f"  skip {iid} (already replayed)")
+            existing_variant = RP.read_replay_variant(out_path)
+            if existing_variant is not None and existing_variant != variant:
+                click.echo(
+                    f"Error: {out_path} was written with variant={existing_variant!r} "
+                    f"but this run requested variant={variant!r}. Refusing to silently mix variants. "
+                    f"Delete the file or run with the matching variant.",
+                    err=True,
+                )
+                sys.exit(1)
+            click.echo(f"  skip {iid} (already replayed, variant={existing_variant or '?'})")
             continue
         traj_path = raw_dir / "trajs" / f"{iid}.txt"
         if not traj_path.exists():
@@ -241,6 +250,13 @@ def augment(config: str, layer: int | None, max_length: int, dry_run: bool) -> N
 @main.command()
 @click.option("--config", required=True, type=click.Path(exists=True))
 @click.option(
+    "--variant",
+    type=click.Choice(sorted(RP.VARIANT_TO_FILENAME.keys())),
+    default="denoised",
+    show_default=True,
+    help="Read replay files from output/swebench/replay/{variant}/.",
+)
+@click.option(
     "--token-offset", default=A.DEFAULT_TOKEN_OFFSET, type=int, show_default=True,
     help="Drop the first N token positions from per-task aggregation.",
 )
@@ -248,14 +264,18 @@ def augment(config: str, layer: int | None, max_length: int, dry_run: bool) -> N
     "--keep-special-tokens", is_flag=True,
     help="Keep tokenizer special-token positions (default: drop them).",
 )
-def analyze(config: str, token_offset: int, keep_special_tokens: bool) -> None:
+def analyze(config: str, variant: str, token_offset: int, keep_special_tokens: bool) -> None:
     """Aggregate per-task scores, run MW / OLS / decile permutation tests."""
     swebench_dir = _swebench_dir(config)
-    replay_dir = swebench_dir / "replay"
-    out_dir = swebench_dir / "analysis"
+    replay_dir = swebench_dir / "replay" / variant
+    out_dir = swebench_dir / "analysis" / variant
 
     if not any(replay_dir.glob("*.safetensors")):
-        click.echo(f"Error: no replay files in {replay_dir}.", err=True)
+        click.echo(
+            f"Error: no replay files in {replay_dir}. "
+            f"Run `swebench-emotions replay --variant {variant}` first.",
+            err=True,
+        )
         sys.exit(1)
 
     A.run_full_analysis(
@@ -265,7 +285,7 @@ def analyze(config: str, token_offset: int, keep_special_tokens: bool) -> None:
     )
     click.echo(
         f"Wrote per_task.csv, stats.csv, summary.json to {out_dir} "
-        f"(token_offset={token_offset}, drop_special={not keep_special_tokens})"
+        f"(variant={variant}, token_offset={token_offset}, drop_special={not keep_special_tokens})"
     )
 
 
@@ -275,18 +295,29 @@ def analyze(config: str, token_offset: int, keep_special_tokens: bool) -> None:
 @main.command()
 @click.option("--config", required=True, type=click.Path(exists=True))
 @click.option("--section", default="all", type=click.Choice(list(A.SECTIONS)))
-def viz(config: str, section: str) -> None:
+@click.option(
+    "--variant",
+    type=click.Choice(sorted(RP.VARIANT_TO_FILENAME.keys())),
+    default="denoised",
+    show_default=True,
+    help="Read replay/analysis files for this variant.",
+)
+def viz(config: str, section: str, variant: str) -> None:
     """Generate per-task timelines + outcome/heatmap/decile plots."""
     import pandas as pd
 
     swebench_dir = _swebench_dir(config)
-    replay_dir = swebench_dir / "replay"
-    analysis_dir = swebench_dir / "analysis"
-    figures_dir = swebench_dir / "figures"
+    replay_dir = swebench_dir / "replay" / variant
+    analysis_dir = swebench_dir / "analysis" / variant
+    figures_dir = swebench_dir / "figures" / variant
 
     per_task_path = analysis_dir / "per_task.csv"
     if not per_task_path.exists():
-        click.echo(f"Error: {per_task_path} missing; run `swebench-emotions analyze` first.", err=True)
+        click.echo(
+            f"Error: {per_task_path} missing; "
+            f"run `swebench-emotions analyze --variant {variant}` first.",
+            err=True,
+        )
         sys.exit(1)
     per_task_df = pd.read_csv(per_task_path)
 

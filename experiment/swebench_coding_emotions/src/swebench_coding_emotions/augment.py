@@ -186,6 +186,121 @@ def _think_neutrals(facts: list[tuple[str, str]] = _FACTS) -> list[str]:
     return out
 
 
+_TRACEBACK_NEUTRALS_RAW = [
+    # IndexError on a list literal — bare, no surrounding apology / diagnosis.
+    'Traceback (most recent call last):\n'
+    '  File "main.py", line 3, in <module>\n'
+    '    print([1, 2, 3][5])\n'
+    'IndexError: list index out of range\n',
+    # KeyError, similarly bare.
+    'Traceback (most recent call last):\n'
+    '  File "main.py", line 2, in <module>\n'
+    '    print({"a": 1}["b"])\n'
+    'KeyError: \'b\'\n',
+    # TypeError on a missing argument.
+    'Traceback (most recent call last):\n'
+    '  File "main.py", line 4, in <module>\n'
+    '    add(1)\n'
+    'TypeError: add() missing 1 required positional argument: \'b\'\n',
+    # ZeroDivisionError.
+    'Traceback (most recent call last):\n'
+    '  File "main.py", line 1, in <module>\n'
+    '    print(1 / 0)\n'
+    'ZeroDivisionError: division by zero\n',
+    # FileNotFoundError.
+    'Traceback (most recent call last):\n'
+    '  File "main.py", line 2, in <module>\n'
+    '    open("missing.txt").read()\n'
+    'FileNotFoundError: [Errno 2] No such file or directory: \'missing.txt\'\n',
+]
+
+
+_PYTEST_NEUTRALS_RAW = [
+    # Single failed assertion, default pytest formatting.
+    '$ pytest -q\n'
+    'F\n'
+    '====================== FAILURES ======================\n'
+    '________________ test_addition ________________\n\n'
+    '    def test_addition():\n'
+    '>       assert 1 + 1 == 3\n'
+    'E       assert 2 == 3\n\n'
+    'tests/test_math.py:2: AssertionError\n'
+    '1 failed in 0.01s\n',
+    # All-pass run, brief.
+    '$ pytest -q\n'
+    '...                                                                      [100%]\n'
+    '3 passed in 0.05s\n',
+    # Mixed pass/fail summary.
+    '$ pytest -q\n'
+    '..F.\n'
+    '====================== FAILURES ======================\n'
+    '________________ test_two ________________\n\n'
+    '    def test_two():\n'
+    '>       assert sorted([3, 1, 2]) == [1, 2, 4]\n'
+    'E       assert [1, 2, 3] == [1, 2, 4]\n\n'
+    'tests/test_sort.py:5: AssertionError\n'
+    '1 failed, 3 passed in 0.04s\n',
+]
+
+
+_SHELL_OUTPUT_NEUTRALS_RAW = [
+    # ls output.
+    '$ ls /tmp\n'
+    'a.txt\nb.txt\nc.txt\n',
+    # grep with results.
+    '$ grep -n "TODO" notes.txt\n'
+    '3:TODO: review section two\n'
+    '11:TODO: confirm date\n',
+    # wc output.
+    '$ wc -l data.csv\n'
+    '42 data.csv\n',
+    # cat showing a small file.
+    '$ cat config.json\n'
+    '{\n  "timeout": 30,\n  "retries": 3\n}\n',
+    # which / not-found pair.
+    '$ which python3\n'
+    '/usr/bin/python3\n'
+    '$ which nonexistent\n'
+    'nonexistent: not found\n',
+]
+
+
+def _traceback_neutrals() -> list[str]:
+    """Bare Python tracebacks introduced and concluded with neutral framing.
+
+    SWE-bench trajectories contain tracebacks routinely; the upstream neutrals
+    don't. Without these, the PCA cannot absorb "traceback" as a structural
+    surface and any emotion-probe activations triggered by traceback formatting
+    leak into the per-task statistics.
+    """
+    out: list[str] = []
+    for body in _TRACEBACK_NEUTRALS_RAW:
+        out.append(
+            f"The script produced the following traceback.\n\n{body}\nThe traceback above describes the error.\n"
+        )
+    return out
+
+
+def _pytest_output_neutrals() -> list[str]:
+    """Neutral pytest run logs (mixed pass/fail). Same motivation as tracebacks."""
+    out: list[str] = []
+    for body in _PYTEST_NEUTRALS_RAW:
+        out.append(
+            f"The test runner produced the following output.\n\n{body}\nThe run is complete.\n"
+        )
+    return out
+
+
+def _shell_output_neutrals() -> list[str]:
+    """Neutral shell stdout snippets: ls, grep, wc, cat, which."""
+    out: list[str] = []
+    for body in _SHELL_OUTPUT_NEUTRALS_RAW:
+        out.append(
+            f"The shell command produced the following output.\n\n{body}\nThe output ends here.\n"
+        )
+    return out
+
+
 def _combined_neutrals() -> list[str]:
     """Chat-template + ``<think>`` + code/diff combined, agent-trajectory shaped."""
     out: list[str] = []
@@ -214,6 +329,9 @@ def build_augmented_neutral_texts() -> list[str]:
         + _code_neutrals()
         + _diff_neutrals()
         + _think_neutrals()
+        + _traceback_neutrals()
+        + _pytest_output_neutrals()
+        + _shell_output_neutrals()
         + _combined_neutrals()
     )
 

@@ -253,6 +253,17 @@ def mann_whitney_tests(
             )
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        # Section had no per-task rows (e.g. "thinking" when no </think>
+        # markers were found, or all tokens were filtered). Return an empty
+        # frame with the expected columns so concatenation downstream is
+        # well-typed.
+        return pd.DataFrame(
+            columns=[
+                "comparison", "section", "emotion", "n_a", "n_b",
+                "mean_a", "mean_b", "u", "p", "rank_biserial", "q_bh",
+            ]
+        )
     # BH-adjust within each (comparison, section) family.
     out["q_bh"] = float("nan")
     for comp_name in out["comparison"].unique():
@@ -419,6 +430,27 @@ def run_full_analysis(
     )
     df.to_csv(out_dir / "per_task.csv", index=False)
 
+    # Warn loudly about (instance, section) cells that ended up empty after
+    # the section + token-offset + special-token mask was applied. These rows
+    # are silently absent from the DataFrame, so downstream MW / OLS would
+    # otherwise compute over unequal sample sizes per emotion without notice.
+    expected_emotions = sorted(df["emotion"].unique().tolist()) if not df.empty else []
+    instance_ids = sorted(df["instance_id"].unique().tolist()) if not df.empty else []
+    dropped: list[tuple[str, str]] = []
+    for iid in instance_ids:
+        present = set(df[df["instance_id"] == iid]["section"].unique())
+        for section in SECTIONS:
+            if section not in present:
+                dropped.append((iid, section))
+    if dropped:
+        logger.warning(
+            "Aggregation produced no rows for %d (instance, section) pairs after "
+            "filtering (token_offset=%d, drop_special=%s). Affected: %s",
+            len(dropped), token_offset, drop_special_tokens,
+            ", ".join(f"{iid}:{section}" for iid, section in dropped[:10])
+            + (" …" if len(dropped) > 10 else ""),
+        )
+
     df_cos = aggregate(
         replay_dir, use_cosine=True,
         token_offset=token_offset, drop_special_tokens=drop_special_tokens,
@@ -451,6 +483,9 @@ def run_full_analysis(
         "emotions": sorted(df["emotion"].unique().tolist()),
         "token_offset": int(token_offset),
         "drop_special_tokens": bool(drop_special_tokens),
+        "empty_section_cells": [
+            {"instance_id": iid, "section": section} for iid, section in dropped
+        ],
         "significant_mw_pass_vs_fail": sorted(
             all_stats[
                 (all_stats["metric"] == "mannwhitney")

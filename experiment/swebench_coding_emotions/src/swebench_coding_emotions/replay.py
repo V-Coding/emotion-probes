@@ -107,8 +107,12 @@ def load_probes(
         vectors = tensors["raw_vectors"]
         from safetensors import safe_open
         with safe_open(str(vec_path), framework="numpy") as f:
-            meta = f.metadata()
+            meta = f.metadata() or {}
         emotions = json.loads(meta["emotions"])
+        if "layer" in meta and int(meta["layer"]) != layer:
+            raise ValueError(
+                f"Layer mismatch in {vec_path}: file says {meta['layer']}, expected {layer}"
+            )
     else:
         vectors, emotions, stored_layer = load_vectors_with_metadata(vec_path)
         if stored_layer != layer:
@@ -288,6 +292,21 @@ def save_replay(result: ReplayResult, path: Path) -> None:
             "probe_variant": result.probe_variant,
         },
     )
+
+
+def read_replay_variant(path: Path) -> str | None:
+    """Return the ``probe_variant`` metadata of a saved replay file, or None.
+
+    Cheap: reads metadata only, not tensors. Used by the replay CLI to refuse
+    silently overwriting a file written for a different probe variant.
+    """
+    from safetensors import safe_open
+    try:
+        with safe_open(str(path), framework="numpy") as f:
+            meta = f.metadata() or {}
+    except (OSError, ValueError):
+        return None
+    return meta.get("probe_variant")
 
 
 def load_replay(path: Path) -> ReplayResult:
