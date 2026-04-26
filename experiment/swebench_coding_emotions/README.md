@@ -54,9 +54,10 @@ bash experiment/swebench_coding_emotions/scripts/run_all.sh
 Or phase by phase:
 
 ```
-bash scripts/01_build_probes.sh       # ~30h on 1xH100 at 4-bit
+bash scripts/01_build_probes.sh        # ~30h on 1xH100 at 4-bit
+bash scripts/01b_augment_neutrals.sh   # refit PCA against trajectory-shaped neutrals
 bash scripts/02_fetch_trajectories.sh
-bash scripts/03_replay.sh
+bash scripts/03_replay.sh --variant augmented
 bash scripts/04_analyze.sh
 bash scripts/05_visualize.sh
 ```
@@ -78,3 +79,38 @@ bash scripts/05_visualize.sh
 - **Harness**: teacher-forced replay of DeepSWE's public trajectories — no
   fresh generation. Chat template is **not** re-applied; the trajectory text
   is the string the agent originally saw.
+
+## Confound-mitigation choices specific to this experiment
+
+The upstream `emotion-probes` package builds emotion directions on plain
+prose stories and PCA-denoises against plain `Person:/AI:` neutral
+dialogues. SWE-bench transcripts are not plain prose: they contain
+chat-template markers, tool-call envelopes, code blocks, unified diffs, and
+`<think>` blocks. Two extra steps mitigate the resulting confounds without
+changing the emotion stimuli themselves:
+
+1. **Augmented neutral set** (`scripts/01b_augment_neutrals.sh`,
+   `src/swebench_coding_emotions/augment.py`). Generates a small
+   experiment-local set of *emotionally-flat* texts that exhibit each
+   trajectory-time structural surface, extracts their activations at the
+   probe layer, unions them with the upstream neutral activations, and
+   refits the PCA denoising. Output:
+   `output/probes/vectors/emotion_vectors_augmented_layer_{L}.safetensors`.
+   Loaded by `replay --variant augmented`. The augmented stimuli are kept
+   topic-generic so the PCA absorbs the structural directions without
+   leaking topic semantics into the denoising basis.
+
+2. **Token-axis filtering at aggregation time** (`analysis.aggregate`).
+   Each per-task summary drops:
+   - The first `--token-offset` positions (default 50, matches the
+     upstream extract-activations offset; the residual stream there is
+     dominated by template/system-prompt boilerplate the probe never saw).
+   - Tokenizer special-token positions (`<|im_start|>`, `</think>`, BOS,
+     etc.). The `<think>...</think>` content *between* the markers is kept
+     — only the marker positions themselves are dropped. Override with
+     `analyze --keep-special-tokens` to disable.
+
+   The `auc` (mean × T) metric was removed: within a task it is perfectly
+   correlated with `mean`, and across tasks it is dominated by trajectory
+   length, which correlates with pass/fail and would confound the
+   group-comparison tests. `mean`, `max`, and `p90` remain.

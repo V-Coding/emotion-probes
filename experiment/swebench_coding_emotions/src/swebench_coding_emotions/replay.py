@@ -49,6 +49,8 @@ class ReplayResult:
     thinking_end_char: int      # -1 if no </think> found
     patch_start_char: int       # -1 if no diff found
     model_fingerprint: str
+    special_token_ids: list[int]  # tokenizer.all_special_ids at replay time
+    probe_variant: str            # "denoised" | "augmented" | "raw"
 
 
 # ---------------------------------------------------------------------------
@@ -65,23 +67,42 @@ def compute_fingerprint(model_name: str, torch_dtype: str, quantize: str | None,
 # Probe asset loading
 # ---------------------------------------------------------------------------
 
+VARIANT_TO_FILENAME = {
+    "denoised": "emotion_vectors",
+    "augmented": "emotion_vectors_augmented",
+    "raw": "raw_vectors",
+}
+
+
 def load_probes(
     probes_output_dir: Path,
     layer: int,
-    use_raw: bool = False,
+    variant: str = "denoised",
 ) -> tuple[np.ndarray, list[str], np.ndarray]:
     """Load emotion vectors + emotion names + global mean for a given layer.
 
     ``probes_output_dir`` is the same directory used as ``output_dir`` during
     the probe-build phase (i.e. ``experiment/.../output/probes``).
+
+    ``variant`` selects which vectors file to load:
+      - ``"denoised"``: upstream PCA-denoised vectors (default)
+      - ``"augmented"``: PCA refit including this experiment's structural neutrals
+      - ``"raw"``: pre-denoising emotion_means - global_mean
     """
+    if variant not in VARIANT_TO_FILENAME:
+        raise ValueError(f"Unknown variant {variant!r}. Expected one of {sorted(VARIANT_TO_FILENAME)}.")
     vectors_dir = probes_output_dir / "vectors"
     act_dir = probes_output_dir / "activations"
 
-    name = "raw_vectors" if use_raw else "emotion_vectors"
+    name = VARIANT_TO_FILENAME[variant]
     vec_path = vectors_dir / f"{name}_layer_{layer}.safetensors"
-    if use_raw:
-        # raw file uses a different tensor key and stores only 'layer' + 'emotions' metadata
+    if not vec_path.exists():
+        raise FileNotFoundError(
+            f"Missing vectors file {vec_path} for variant={variant!r}. "
+            "If variant='augmented', run `swebench-emotions augment` first."
+        )
+
+    if variant == "raw":
         tensors = load_tensors(vec_path)
         vectors = tensors["raw_vectors"]
         from safetensors import safe_open
@@ -132,6 +153,7 @@ def replay_trajectory(
     window_tokens: int = 8192,
     stride_tokens: int = 7168,
     model_fingerprint: str | None = None,
+    probe_variant: str = "denoised",
 ) -> ReplayResult:
     """Run sliding-window forward passes and return per-token probe scores.
 
@@ -217,6 +239,8 @@ def replay_trajectory(
         model.config.name, model.config.torch_dtype, model.config.quantize, layer
     )
 
+    special_ids = sorted({int(i) for i in (model.tokenizer.all_special_ids or [])})
+
     return ReplayResult(
         instance_id=instance_id,
         scores=scores.astype(np.float16),
@@ -231,6 +255,8 @@ def replay_trajectory(
         thinking_end_char=think_end,
         patch_start_char=patch_start,
         model_fingerprint=fingerprint,
+        special_token_ids=special_ids,
+        probe_variant=probe_variant,
     )
 
 
@@ -258,6 +284,8 @@ def save_replay(result: ReplayResult, path: Path) -> None:
             "thinking_end_char": str(result.thinking_end_char),
             "patch_start_char": str(result.patch_start_char),
             "model_fingerprint": result.model_fingerprint,
+            "special_token_ids": json.dumps(result.special_token_ids),
+            "probe_variant": result.probe_variant,
         },
     )
 
@@ -267,6 +295,9 @@ def load_replay(path: Path) -> ReplayResult:
     from safetensors import safe_open
     with safe_open(str(path), framework="numpy") as f:
         meta = f.metadata()
+    special_raw = meta.get("special_token_ids")
+    special_ids: list[int] = json.loads(special_raw) if special_raw else []
+    probe_variant = meta.get("probe_variant", "denoised")
     return ReplayResult(
         instance_id=meta["instance_id"],
         scores=tensors["scores"],
@@ -281,4 +312,6 @@ def load_replay(path: Path) -> ReplayResult:
         thinking_end_char=int(meta["thinking_end_char"]),
         patch_start_char=int(meta["patch_start_char"]),
         model_fingerprint=meta["model_fingerprint"],
+        special_token_ids=special_ids,
+        probe_variant=probe_variant,
     )
