@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 SECTIONS = ("thinking", "agent", "patch", "all")
+DEFAULT_TOKEN_OFFSET = 50  # matches upstream extract-activations token_offset
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,35 @@ def _section_mask(
     raise ValueError(f"Unknown section: {section}")
 
 
+def _aggregation_mask(
+    token_ids: np.ndarray,
+    special_token_ids: list[int] | None,
+    token_offset: int,
+) -> np.ndarray:
+    """Boolean mask (T,) keeping tokens eligible for per-task aggregation.
+
+    Drops:
+      - the first ``token_offset`` token positions (matches probe-build offset;
+        the residual stream there is dominated by template/system-prompt
+        boilerplate the probe never saw)
+      - any position whose token id is a tokenizer special token
+        (e.g. ``<|im_start|>``, ``<|im_end|>``, ``<think>``, ``</think>``,
+        BOS/EOS/PAD). Content *between* these markers is kept; only the
+        marker positions themselves are dropped.
+
+    Special-token filtering only runs when ``special_token_ids`` is provided
+    (non-empty). Older replay files without the metadata get only the offset.
+    """
+    T = token_ids.shape[0]
+    mask = np.ones(T, dtype=bool)
+    if token_offset > 0:
+        mask[: min(token_offset, T)] = False
+    if special_token_ids:
+        special_arr = np.asarray(list(special_token_ids), dtype=token_ids.dtype)
+        mask &= ~np.isin(token_ids, special_arr)
+    return mask
+
+
 def _difficulty_bucket(difficulty: str) -> str:
     if difficulty in EASY_LABELS:
         return "easy"
@@ -81,11 +111,23 @@ def _difficulty_bucket(difficulty: str) -> str:
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def aggregate(replay_dir: Path, use_cosine: bool = False) -> pd.DataFrame:
+def aggregate(
+    replay_dir: Path,
+    use_cosine: bool = False,
+    *,
+    token_offset: int = DEFAULT_TOKEN_OFFSET,
+    drop_special_tokens: bool = True,
+) -> pd.DataFrame:
     """Load every .safetensors replay and summarize per (task, emotion, section).
 
-    Columns: instance_id, resolved, difficulty, difficulty_bucket, n_tokens,
-    section, emotion, mean, max, p90, auc.
+    The first ``token_offset`` token positions are excluded (matches the
+    upstream probe-build offset) and tokens whose ids are tokenizer special
+    tokens (``<|im_start|>``, ``</think>``, etc.) are dropped — content
+    between markers is kept. Both filters are applied in addition to the
+    section mask.
+
+    Columns: instance_id, resolved, difficulty, difficulty_bucket,
+    n_tokens, n_kept, section, emotion, mean, max, p90.
     """
     rows: list[dict] = []
     files = sorted(Path(replay_dir).glob("*.safetensors"))
@@ -96,13 +138,17 @@ def aggregate(replay_dir: Path, use_cosine: bool = False) -> pd.DataFrame:
         r = load_replay(f)
         scores = r.cosine.astype(np.float32) if use_cosine else r.scores.astype(np.float32)
         T = scores.shape[0]
+        special_ids = r.special_token_ids if drop_special_tokens else None
+        agg_mask = _aggregation_mask(r.token_ids, special_ids, token_offset)
         for section in SECTIONS:
-            mask = _section_mask(
+            section_mask = _section_mask(
                 r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section
             )
+            mask = section_mask & agg_mask
             if not mask.any():
                 continue
             sel = scores[mask]  # (T', K)
+            n_kept = int(mask.sum())
             for k, emo in enumerate(r.emotions):
                 col = sel[:, k]
                 rows.append(
@@ -112,12 +158,12 @@ def aggregate(replay_dir: Path, use_cosine: bool = False) -> pd.DataFrame:
                         "difficulty": r.difficulty,
                         "difficulty_bucket": _difficulty_bucket(r.difficulty),
                         "n_tokens": T,
+                        "n_kept": n_kept,
                         "section": section,
                         "emotion": emo,
                         "mean": float(col.mean()),
                         "max": float(col.max()),
                         "p90": float(np.percentile(col, 90)),
-                        "auc": float(col.mean() * T),
                     }
                 )
     return pd.DataFrame(rows)
@@ -207,6 +253,17 @@ def mann_whitney_tests(
             )
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        # Section had no per-task rows (e.g. "thinking" when no </think>
+        # markers were found, or all tokens were filtered). Return an empty
+        # frame with the expected columns so concatenation downstream is
+        # well-typed.
+        return pd.DataFrame(
+            columns=[
+                "comparison", "section", "emotion", "n_a", "n_b",
+                "mean_a", "mean_b", "u", "p", "rank_biserial", "q_bh",
+            ]
+        )
     # BH-adjust within each (comparison, section) family.
     out["q_bh"] = float("nan")
     for comp_name in out["comparison"].unique():
@@ -274,6 +331,9 @@ def decile_permutation(
     section: str = "all",
     n_perm: int = 1000,
     seed: int = 42,
+    *,
+    token_offset: int = DEFAULT_TOKEN_OFFSET,
+    drop_special_tokens: bool = True,
 ) -> pd.DataFrame:
     """Cluster-based permutation test on pass-vs-fail decile time courses.
 
@@ -289,9 +349,12 @@ def decile_permutation(
 
     for f in files:
         r = load_replay(f)
-        mask = _section_mask(
+        section_mask = _section_mask(
             r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section
         )
+        special_ids = r.special_token_ids if drop_special_tokens else None
+        agg_mask = _aggregation_mask(r.token_ids, special_ids, token_offset)
+        mask = section_mask & agg_mask
         if not mask.any():
             continue
         prof = _decile_means(r.scores.astype(np.float32), mask)
@@ -346,14 +409,52 @@ def decile_permutation(
 # Top-level driver
 # ---------------------------------------------------------------------------
 
-def run_full_analysis(replay_dir: Path, out_dir: Path) -> None:
-    """Write per_task.csv, stats.csv, summary.json to ``out_dir``."""
+def run_full_analysis(
+    replay_dir: Path,
+    out_dir: Path,
+    *,
+    token_offset: int = DEFAULT_TOKEN_OFFSET,
+    drop_special_tokens: bool = True,
+) -> None:
+    """Write per_task.csv, stats.csv, summary.json to ``out_dir``.
+
+    Token-axis filtering applied uniformly across `aggregate` and
+    `decile_permutation`: drop the first ``token_offset`` positions, drop
+    tokenizer special-token positions (preserving content between markers).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = aggregate(replay_dir, use_cosine=False)
+    df = aggregate(
+        replay_dir, use_cosine=False,
+        token_offset=token_offset, drop_special_tokens=drop_special_tokens,
+    )
     df.to_csv(out_dir / "per_task.csv", index=False)
 
-    df_cos = aggregate(replay_dir, use_cosine=True)
+    # Warn loudly about (instance, section) cells that ended up empty after
+    # the section + token-offset + special-token mask was applied. These rows
+    # are silently absent from the DataFrame, so downstream MW / OLS would
+    # otherwise compute over unequal sample sizes per emotion without notice.
+    expected_emotions = sorted(df["emotion"].unique().tolist()) if not df.empty else []
+    instance_ids = sorted(df["instance_id"].unique().tolist()) if not df.empty else []
+    dropped: list[tuple[str, str]] = []
+    for iid in instance_ids:
+        present = set(df[df["instance_id"] == iid]["section"].unique())
+        for section in SECTIONS:
+            if section not in present:
+                dropped.append((iid, section))
+    if dropped:
+        logger.warning(
+            "Aggregation produced no rows for %d (instance, section) pairs after "
+            "filtering (token_offset=%d, drop_special=%s). Affected: %s",
+            len(dropped), token_offset, drop_special_tokens,
+            ", ".join(f"{iid}:{section}" for iid, section in dropped[:10])
+            + (" …" if len(dropped) > 10 else ""),
+        )
+
+    df_cos = aggregate(
+        replay_dir, use_cosine=True,
+        token_offset=token_offset, drop_special_tokens=drop_special_tokens,
+    )
     df_cos.to_csv(out_dir / "per_task_cosine.csv", index=False)
 
     stats_rows: list[pd.DataFrame] = []
@@ -364,7 +465,10 @@ def run_full_analysis(replay_dir: Path, out_dir: Path) -> None:
         ols_df = length_control_ols(df, section=section)
         ols_df["metric"] = "ols_length_control"
         stats_rows.append(ols_df)
-        dec = decile_permutation(replay_dir, section=section)
+        dec = decile_permutation(
+            replay_dir, section=section,
+            token_offset=token_offset, drop_special_tokens=drop_special_tokens,
+        )
         dec["metric"] = "decile_permutation"
         stats_rows.append(dec)
 
@@ -377,6 +481,11 @@ def run_full_analysis(replay_dir: Path, out_dir: Path) -> None:
         "pass_count": int(df.drop_duplicates("instance_id")["resolved"].sum()),
         "sections": list(SECTIONS),
         "emotions": sorted(df["emotion"].unique().tolist()),
+        "token_offset": int(token_offset),
+        "drop_special_tokens": bool(drop_special_tokens),
+        "empty_section_cells": [
+            {"instance_id": iid, "section": section} for iid, section in dropped
+        ],
         "significant_mw_pass_vs_fail": sorted(
             all_stats[
                 (all_stats["metric"] == "mannwhitney")

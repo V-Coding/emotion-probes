@@ -1,4 +1,13 @@
-"""Plots: per-task timelines, outcome box plots, task-emotion heatmap, decile curves."""
+"""Plots: per-task timelines, outcome box plots, task-emotion heatmap, decile curves.
+
+Visualization intentionally applies only ``_section_mask`` from analysis.py,
+not the per-task aggregation mask (token-offset + special-token filtering).
+The aggregation mask shapes the *statistics* (Mann-Whitney, OLS,
+permutation); the plots show the underlying per-token series so the user
+can eyeball spikes at template markers, the first 50 tokens, etc., and
+reconcile the figures with the stats. Don't add ``_aggregation_mask`` here
+without also revisiting that contract.
+"""
 
 from __future__ import annotations
 
