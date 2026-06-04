@@ -2,7 +2,9 @@
 
 The submission at `s3://swe-bench-submissions/verified/20250629_deepswerl_r2eagent/`
 is mirrored over HTTPS at `https://swe-bench-submissions.s3.amazonaws.com/...`.
-For every instance listed in `results/results.json` we download:
+That bucket holds only `trajs/` and `logs/` (there is no `results/results.json`),
+so we discover the instance set by listing the `trajs/` folder, then for every
+instance download:
 
 - `trajs/<instance_id>.txt`          — full agent transcript (already templated)
 - `logs/<instance_id>/report.json`   — per-task resolved=true/false
@@ -16,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -26,6 +29,8 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 _S3_BASE = "https://swe-bench-submissions.s3.amazonaws.com/verified"
+_BUCKET_URL = "https://swe-bench-submissions.s3.amazonaws.com/"
+_S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 _DEFAULT_SUBMISSION = "20250629_deepswerl_r2eagent"
 
 EASY_LABELS = {"<15 min fix", "15 min - 1 hour"}
@@ -60,8 +65,41 @@ def _http_get(url: str, cache_path: Path, timeout: int = 60) -> str:
     return text
 
 
-def _results_url(submission: str) -> str:
-    return f"{_S3_BASE}/{submission}/results/results.json"
+def _list_instance_ids(submission: str, timeout: int = 60) -> list[str]:
+    """Discover the instance set by listing the submission's ``trajs/`` folder.
+
+    The submissions bucket exposes no ``results/results.json``; the authoritative
+    population for a submission is exactly its per-task transcripts. Paginates the
+    S3 ListObjectsV2 XML response (SWE-bench Verified is 500 tasks, so this is
+    usually a single page).
+    """
+    prefix = f"verified/{submission}/trajs/"
+    suffix = ".txt"
+    ids: list[str] = []
+    token: str | None = None
+    while True:
+        params = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
+        if token:
+            params["continuation-token"] = token
+        resp = requests.get(_BUCKET_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        for contents in root.findall("s3:Contents", _S3_NS):
+            key = contents.findtext("s3:Key", default="", namespaces=_S3_NS)
+            if key.endswith(suffix):
+                ids.append(key[len(prefix) : -len(suffix)])
+        truncated = root.findtext("s3:IsTruncated", default="false", namespaces=_S3_NS)
+        if truncated.strip().lower() != "true":
+            break
+        token = root.findtext("s3:NextContinuationToken", namespaces=_S3_NS)
+        if not token:
+            break
+    if not ids:
+        raise RuntimeError(
+            f"No transcripts found under s3://swe-bench-submissions/{prefix} — "
+            f"is the submission name {submission!r} correct?"
+        )
+    return sorted(set(ids))
 
 
 def _traj_url(submission: str, instance_id: str) -> str:
@@ -125,23 +163,19 @@ def fetch_all(
     """Download (or load cached) all trajectories for a submission.
 
     Caches to `<cache_dir>/trajs/<id>.txt`, `<cache_dir>/reports/<id>.json`,
-    and `<cache_dir>/results.json`. Skips instances whose report is missing
+    and `<cache_dir>/instance_ids.json`. Skips instances whose report is missing
     or cannot be parsed.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    results_raw = _http_get(_results_url(submission), cache_dir / "results.json")
-    results = json.loads(results_raw)
-    instance_ids: list[str] = results.get("submitted_instances") or list(results.get("resolved_ids", []))
-    if not instance_ids:
-        # Fallback: some submissions store a flat list under "instance_ids"
-        instance_ids = list(results.get("instance_ids", []))
-    if not instance_ids:
-        raise RuntimeError(
-            f"Could not find instance list in results.json for {submission}. "
-            f"Keys present: {sorted(results.keys())}"
-        )
+    ids_cache = cache_dir / "instance_ids.json"
+    if ids_cache.exists():
+        instance_ids = json.loads(ids_cache.read_text(encoding="utf-8"))
+    else:
+        instance_ids = _list_instance_ids(submission)
+        ids_cache.write_text(json.dumps(instance_ids), encoding="utf-8")
+    logger.info("Discovered %d instances for submission %s", len(instance_ids), submission)
 
     if limit is not None:
         instance_ids = instance_ids[:limit]
