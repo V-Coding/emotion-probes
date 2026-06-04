@@ -71,7 +71,10 @@ bash scripts/05_visualize.sh
   `analyze`, and `viz` subcommands all take `--variant` and read/write the matching
   subtree, so multiple variants can coexist without clobbering each other.
 - `output/swebench/analysis/{variant}/` — per_task.csv, stats.csv, summary.json.
-- `output/swebench/figures/{variant}/` — timelines, box plots, heatmap, decile curves.
+  `stats.csv` includes `metric=valence` rows (the single-axis distress composite,
+  one test per section) and `summary.json` carries `valence_pass_vs_fail`.
+- `output/swebench/figures/{variant}/` — timelines, box plots, valence box plot,
+  heatmap, decile curves.
 
 ## Decisions
 
@@ -128,3 +131,31 @@ changing the emotion stimuli themselves:
    `summary.json["empty_section_cells"]`. This protects against
    silently-unequal sample sizes per emotion in the Mann-Whitney / OLS
    tests.
+
+3. **Span-based section markers** (`replay._find_section_spans`,
+   `analysis._section_mask`). The R2E-agent trajectories are multi-turn
+   (`Thought:` → `<think>…</think>` → `Action:` → `<function=…>` →
+   `Observation:`, ×dozens) and the model routinely leaves `</think>`
+   unclosed (one task: 52 opens / 11 closes; two tasks never close it). A
+   single "last `</think>`" marker therefore stretches `thinking` over
+   almost the whole trajectory, and *how much* it covers correlates with
+   pass/fail — a confound. The transcripts also contain no final
+   `diff --git`; the model edits via `file_editor` tool calls. So sections
+   are now defined per span: `thinking` = union of per-turn `Thought:` →
+   `Action:` reasoning spans, `patch` = union of file-editing `file_editor`
+   calls (`str_replace` / `create` / `insert`), `agent` = everything
+   outside both. Spans are computed and persisted at replay time;
+   pre-spans replay files fall back to the legacy single-marker logic, so
+   **the new definitions take effect only after re-running `replay`**.
+
+4. **Valence composite** (`analysis.compute_valence` / `valence_tests`,
+   `metric=valence` in `stats.csv`). The 15 emotion probes are highly
+   correlated — PC1 of the emotion directions is essentially a valence
+   axis — so 15 BH-corrected per-emotion tests waste power and under-report
+   one coherent effect. The composite z-scores each valenced emotion's
+   per-task `mean` across tasks, flips the positive-valence emotions
+   (signs in `analysis.VALENCE`; `curious`/`bored` excluded as
+   engagement-not-distress), and averages to a single per-task distress
+   score (higher = more negative affect). Each section then gets one
+   pass-vs-fail test (Mann-Whitney + label-shuffle permutation), no BH
+   correction needed.

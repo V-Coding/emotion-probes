@@ -41,6 +41,70 @@ def test_find_section_markers_uses_last_think_block():
 
 
 # ---------------------------------------------------------------------------
+# Span-based section markers (multi-turn R2E-agent format)
+# ---------------------------------------------------------------------------
+
+def _two_turn_transcript() -> str:
+    # Turn 0: closes </think>, then an editing file_editor call (str_replace).
+    # Turn 1: never closes </think> (the common case), then a read-only view call.
+    return (
+        "System prompt: wrap reasoning in <think> tags and write Thought: first.\n"
+        "================\nStep 0:\n\nThought:\n\n<think>\nreason one\n</think>\n"
+        "Action:\n\n<function=file_editor>\n  <parameter=command>str_replace</parameter>\n"
+        "  <parameter=old_str>a</parameter>\n  <parameter=new_str>b</parameter>\n</function>\n"
+        "Observation:\n\nedit applied\n"
+        "================\nStep 1:\n\nThought:\n\n<think>\nreason two, no close tag\n"
+        "Action:\n\n<function=file_editor>\n  <parameter=command>view</parameter>\n"
+        "  <parameter=path>/x</parameter>\n</function>\n"
+        "Observation:\n\nfile contents\n"
+    )
+
+
+def test_find_section_spans_thinking_uses_thought_to_action():
+    txt = _two_turn_transcript()
+    thinking, _ = RP._find_section_spans(txt)
+    assert len(thinking) == 2
+    # Turn 0 reasoning is bounded by the closed </think>.
+    assert txt[thinking[0][0]:thinking[0][1]] == "\nreason one\n"
+    # Turn 1 never closes </think>, so it runs up to the next Action:.
+    s1, e1 = thinking[1]
+    assert txt[s1:e1].startswith("\nreason two, no close tag")
+    assert "Action:" not in txt[s1:e1]
+
+
+def test_find_section_spans_patch_only_editing_calls():
+    txt = _two_turn_transcript()
+    _, patch = RP._find_section_spans(txt)
+    # Only the str_replace call is a patch span; the view call is excluded.
+    assert len(patch) == 1
+    block = txt[patch[0][0]:patch[0][1]]
+    assert block.startswith("<function=file_editor>")
+    assert block.endswith("</function>")
+    assert "str_replace" in block
+    assert "view" not in block
+
+
+def test_find_section_spans_includes_create_and_insert():
+    txt = (
+        "Step 0:\nThought:\n<think>x</think>\nAction:\n"
+        "<function=file_editor>\n<parameter=command>create</parameter>\n"
+        "<parameter=file_text>new file</parameter>\n</function>\nObservation:\nok\n"
+        "Step 1:\nThought:\n<think>y</think>\nAction:\n"
+        "<function=file_editor>\n<parameter=command>insert</parameter>\n</function>\nObservation:\nok\n"
+        "Step 2:\nThought:\n<think>z</think>\nAction:\n"
+        "<function=search>\n<parameter=search_term>q</parameter>\n</function>\nObservation:\nok\n"
+    )
+    _, patch = RP._find_section_spans(txt)
+    assert len(patch) == 2  # create + insert; search is not a file edit
+
+
+def test_find_section_spans_empty_when_no_turns():
+    thinking, patch = RP._find_section_spans("plain prose, no markers at all")
+    assert thinking == []
+    assert patch == []
+
+
+# ---------------------------------------------------------------------------
 # Fingerprint
 # ---------------------------------------------------------------------------
 
@@ -133,6 +197,33 @@ def test_load_replay_back_compat_when_metadata_missing(tmp_path: Path):
     loaded = RP.load_replay(out)
     assert loaded.special_token_ids == []
     assert loaded.probe_variant == "denoised"
+    # No span metadata => None => analysis falls back to legacy single markers.
+    assert loaded.thinking_spans is None
+    assert loaded.patch_spans is None
+
+
+def test_save_load_roundtrip_spans(tmp_path: Path):
+    result = _make_replay_result()
+    result.thinking_spans = [(3, 9), (20, 25)]
+    result.patch_spans = [(30, 48)]
+    out = tmp_path / "spans.safetensors"
+    RP.save_replay(result, out)
+    loaded = RP.load_replay(out)
+    assert loaded.thinking_spans == [(3, 9), (20, 25)]
+    assert loaded.patch_spans == [(30, 48)]
+
+
+def test_save_load_roundtrip_empty_spans_distinct_from_missing(tmp_path: Path):
+    """A replay written with no spans found ([]) must load as [] (span logic,
+    no spans) — distinct from a legacy file with no field at all (None)."""
+    result = _make_replay_result()
+    result.thinking_spans = []
+    result.patch_spans = []
+    out = tmp_path / "empty_spans.safetensors"
+    RP.save_replay(result, out)
+    loaded = RP.load_replay(out)
+    assert loaded.thinking_spans == []
+    assert loaded.patch_spans == []
 
 
 # ---------------------------------------------------------------------------

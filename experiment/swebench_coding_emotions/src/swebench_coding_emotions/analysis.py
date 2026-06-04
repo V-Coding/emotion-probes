@@ -4,9 +4,15 @@ Pipeline:
 
 1. ``aggregate(replay_dir)`` → long-format pandas.DataFrame with one row per
    (instance_id, emotion, section). Sections are {"thinking", "agent", "patch",
-   "all"} where ``thinking`` is the span ending at the last ``</think>``,
-   ``patch`` is from the first ``diff --git`` onward, and ``agent`` is
-   everything between.
+   "all"}. For replay files written with span markers, ``thinking`` is the union
+   of per-turn reasoning spans (``Thought:`` → ``Action:``), ``patch`` is the
+   union of file-editing ``file_editor`` tool calls, and ``agent`` is everything
+   outside both. For legacy files without spans the old single-marker split is
+   used (``thinking`` up to the last ``</think>``, ``patch`` from the first
+   ``diff --git`` onward, ``agent`` between) — see ``_section_mask``.
+
+   A "valence" composite (``compute_valence`` / ``valence_tests``) collapses the
+   per-emotion scores onto a single signed distress axis; see those functions.
 
 2. ``mann_whitney_tests(df)`` → DataFrame of Mann-Whitney U tests per emotion
    (pass vs fail, easy vs hard), with rank-biserial effect sizes and
@@ -40,10 +46,34 @@ logger = logging.getLogger(__name__)
 SECTIONS = ("thinking", "agent", "patch", "all")
 DEFAULT_TOKEN_OFFSET = 50  # matches upstream extract-activations token_offset
 
+# Affective valence sign for the distress composite: +1 = negative pole,
+# -1 = positive pole. Emotions absent from the map (curious, bored) are treated
+# as valence-ambiguous (engagement, not distress) and excluded. The signs
+# match PC1 of the emotion directions (probes/analysis/pca_interpretation),
+# which orders angry/anxious/overwhelmed/frustrated at one pole and
+# calm/satisfied/hopeful/proud/confident at the other.
+VALENCE: dict[str, int] = {
+    "frustrated": +1, "confused": +1, "doubtful": +1, "anxious": +1,
+    "disappointed": +1, "overwhelmed": +1, "angry": +1,
+    "confident": -1, "satisfied": -1, "determined": -1, "calm": -1,
+    "proud": -1, "hopeful": -1,
+}
+
 
 # ---------------------------------------------------------------------------
 # Section masks over the token axis
 # ---------------------------------------------------------------------------
+
+def _tokens_in_spans(
+    char_starts: np.ndarray,
+    spans: list[tuple[int, int]],
+) -> np.ndarray:
+    """Boolean mask (T,) for tokens whose start falls in any ``[start, end)`` span."""
+    mask = np.zeros_like(char_starts, dtype=bool)
+    for start, end in spans:
+        mask |= (char_starts >= start) & (char_starts < end)
+    return mask
+
 
 def _section_mask(
     char_starts: np.ndarray,
@@ -51,19 +81,38 @@ def _section_mask(
     think_end_char: int,
     patch_start_char: int,
     section: str,
+    *,
+    thinking_spans: list[tuple[int, int]] | None = None,
+    patch_spans: list[tuple[int, int]] | None = None,
 ) -> np.ndarray:
-    """Boolean mask (T,) selecting tokens belonging to a given section."""
+    """Boolean mask (T,) selecting tokens belonging to a given section.
+
+    When ``thinking_spans`` / ``patch_spans`` are provided (replay files written
+    after the span fix), sections are defined by span membership:
+    ``thinking`` = reasoning spans, ``patch`` = file-edit spans, ``agent`` =
+    everything outside both. When they are ``None`` (legacy replay files), we
+    fall back to the original single-marker logic (``thinking`` up to the last
+    ``</think>``, ``patch`` from the first ``diff --git`` on, ``agent`` between).
+    """
     if section == "all":
         return np.ones_like(char_starts, dtype=bool)
     if section == "thinking":
+        if thinking_spans is not None:
+            return _tokens_in_spans(char_starts, thinking_spans)
         if think_end_char < 0:
             return np.zeros_like(char_starts, dtype=bool)
         return char_ends <= think_end_char
     if section == "patch":
+        if patch_spans is not None:
+            return _tokens_in_spans(char_starts, patch_spans)
         if patch_start_char < 0:
             return np.zeros_like(char_starts, dtype=bool)
         return char_starts >= patch_start_char
     if section == "agent":
+        if thinking_spans is not None or patch_spans is not None:
+            think_m = _tokens_in_spans(char_starts, thinking_spans or [])
+            patch_m = _tokens_in_spans(char_starts, patch_spans or [])
+            return ~(think_m | patch_m)
         lo = think_end_char if think_end_char >= 0 else 0
         hi = patch_start_char if patch_start_char >= 0 else char_ends[-1] + 1
         return (char_starts >= lo) & (char_ends <= hi)
@@ -142,7 +191,8 @@ def aggregate(
         agg_mask = _aggregation_mask(r.token_ids, special_ids, token_offset)
         for section in SECTIONS:
             section_mask = _section_mask(
-                r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section
+                r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section,
+                thinking_spans=r.thinking_spans, patch_spans=r.patch_spans,
             )
             mask = section_mask & agg_mask
             if not mask.any():
@@ -274,6 +324,130 @@ def mann_whitney_tests(
 
 
 # ---------------------------------------------------------------------------
+# Valence composite: collapse the 15 correlated probes onto one distress axis
+# ---------------------------------------------------------------------------
+
+def _permutation_p(a: np.ndarray, b: np.ndarray, rng: np.random.Generator, n_perm: int) -> float:
+    """Two-sided label-shuffle p-value on the difference in means (mean_b - mean_a)."""
+    obs = b.mean() - a.mean()
+    pool = np.concatenate([a, b])
+    n_a = len(a)
+    count = 0
+    for _ in range(n_perm):
+        perm = rng.permutation(pool)
+        if abs(perm[n_a:].mean() - perm[:n_a].mean()) >= abs(obs) - 1e-12:
+            count += 1
+    return (count + 1) / (n_perm + 1)
+
+
+def compute_valence(df: pd.DataFrame, section: str = "all") -> pd.DataFrame:
+    """Per-task negative-valence ("distress") composite for one section.
+
+    The 15 emotion probes are highly correlated — their first principal
+    component is essentially a valence axis — so 15 BH-corrected per-emotion
+    tests both waste power and under-report one coherent effect. This collapses
+    them onto a single axis: z-score each valenced emotion's per-task ``mean``
+    across tasks, flip the positive-valence emotions, and average. Higher =
+    more negative affect. ``curious``/``bored`` are excluded (see ``VALENCE``).
+
+    Returns columns: instance_id, resolved, difficulty_bucket, valence.
+    """
+    cols = ["instance_id", "resolved", "difficulty_bucket", "valence"]
+    sub = df[df["section"] == section]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+    piv = sub.pivot_table(
+        index=["instance_id", "resolved", "difficulty_bucket"],
+        columns="emotion", values="mean",
+    )
+    emos = [e for e in piv.columns if e in VALENCE]
+    if not emos:
+        return pd.DataFrame(columns=cols)
+    block = piv[emos]
+    std = block.std(axis=0, ddof=1).replace(0, np.nan)
+    z = (block - block.mean(axis=0)) / std
+    signs = np.array([VALENCE[e] for e in emos], dtype=float)
+    weighted = z.values * signs
+    counts = (~np.isnan(weighted)).sum(axis=1)
+    with np.errstate(invalid="ignore"):
+        # Signed mean over the emotions that have a defined z-score for each
+        # task; tasks with none (e.g. a single-task section) get NaN, no warning.
+        valence = np.where(counts > 0, np.nansum(weighted, axis=1) / np.maximum(counts, 1), np.nan)
+    out = piv.index.to_frame(index=False)
+    out["valence"] = valence
+    return out
+
+
+def valence_tests(
+    df: pd.DataFrame,
+    section: str = "all",
+    *,
+    n_perm: int = 20000,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Group tests on the single valence composite (one test family, no BH needed).
+
+    Mirrors the comparisons of ``mann_whitney_tests`` (pass vs fail, easy vs
+    hard, pass vs fail | hard) but on ``compute_valence`` rather than per
+    emotion. Reports Mann-Whitney U, rank-biserial (positive => group b
+    higher), and a label-shuffle permutation p (more honest at this sample
+    size). Rows use ``emotion = "__valence__"``.
+    """
+    cols = [
+        "comparison", "section", "emotion", "n_a", "n_b",
+        "mean_a", "mean_b", "u", "p", "rank_biserial", "p_perm",
+    ]
+    val = compute_valence(df, section)
+    if val.empty or val["valence"].isna().all():
+        return pd.DataFrame(columns=cols)
+    val = val.dropna(subset=["valence"])
+    rng = np.random.default_rng(seed)
+
+    comparisons = [
+        ("pass_vs_fail", lambda d: (d[d["resolved"]], d[~d["resolved"]])),
+        (
+            "easy_vs_hard",
+            lambda d: (d[d["difficulty_bucket"] == "easy"], d[d["difficulty_bucket"] == "hard"]),
+        ),
+        (
+            "pass_vs_fail_hard",
+            lambda d: (
+                d[(d["difficulty_bucket"] == "hard") & d["resolved"]],
+                d[(d["difficulty_bucket"] == "hard") & ~d["resolved"]],
+            ),
+        ),
+    ]
+
+    rows: list[dict] = []
+    for comp_name, split in comparisons:
+        ga, gb = split(val)
+        a, b = ga["valence"].values, gb["valence"].values
+        if len(a) < 2 or len(b) < 2:
+            u = p = rb = pp = float("nan")
+        else:
+            res = stats.mannwhitneyu(a, b, alternative="two-sided")
+            u, p = float(res.statistic), float(res.pvalue)
+            rb = _rank_biserial(u, len(a), len(b))
+            pp = _permutation_p(a, b, rng, n_perm)
+        rows.append(
+            {
+                "comparison": comp_name,
+                "section": section,
+                "emotion": "__valence__",
+                "n_a": len(a),
+                "n_b": len(b),
+                "mean_a": float(np.mean(a)) if len(a) else float("nan"),
+                "mean_b": float(np.mean(b)) if len(b) else float("nan"),
+                "u": u,
+                "p": p,
+                "rank_biserial": rb,
+                "p_perm": pp,
+            }
+        )
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ---------------------------------------------------------------------------
 # OLS length control
 # ---------------------------------------------------------------------------
 
@@ -350,7 +524,8 @@ def decile_permutation(
     for f in files:
         r = load_replay(f)
         section_mask = _section_mask(
-            r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section
+            r.char_starts, r.char_ends, r.thinking_end_char, r.patch_start_char, section,
+            thinking_spans=r.thinking_spans, patch_spans=r.patch_spans,
         )
         special_ids = r.special_token_ids if drop_special_tokens else None
         agg_mask = _aggregation_mask(r.token_ids, special_ids, token_offset)
@@ -471,6 +646,9 @@ def run_full_analysis(
         )
         dec["metric"] = "decile_permutation"
         stats_rows.append(dec)
+        val = valence_tests(df, section=section)
+        val["metric"] = "valence"
+        stats_rows.append(val)
 
     all_stats = pd.concat(stats_rows, ignore_index=True, sort=False)
     all_stats.to_csv(out_dir / "stats.csv", index=False)
@@ -495,5 +673,12 @@ def run_full_analysis(
             .to_dict("records"),
             key=lambda r: r["q_bh"],
         ),
+        # Single-axis valence composite (no BH: one test per section). Positive
+        # rank_biserial => failing tasks score more negative-valence.
+        "valence_pass_vs_fail": all_stats[
+            (all_stats["metric"] == "valence")
+            & (all_stats["comparison"] == "pass_vs_fail")
+        ][["section", "n_a", "n_b", "mean_a", "mean_b", "p", "p_perm", "rank_biserial"]]
+        .to_dict("records"),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from .analysis import _section_mask
+from .analysis import _section_mask, compute_valence
 from .replay import load_replay
 from .trajectories import EASY_LABELS, HARD_LABELS
 
@@ -40,12 +40,26 @@ def _difficulty_bucket(d: str) -> str:
 # Per-task timeline: one panel per emotion
 # ---------------------------------------------------------------------------
 
+def _span_token_ranges(char_starts: np.ndarray, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Map ``[start, end)`` char spans to ``[lo, hi)`` token-index ranges."""
+    out: list[tuple[int, int]] = []
+    for s, e in spans:
+        lo = int(np.searchsorted(char_starts, s, side="left"))
+        hi = int(np.searchsorted(char_starts, e, side="left"))
+        if hi > lo:
+            out.append((lo, hi))
+    return out
+
+
 def plot_timeline(replay_path: Path, out_path: Path) -> None:
     r = load_replay(replay_path)
     scores = r.scores.astype(np.float32)
     T, K = scores.shape
 
-    # Find char positions of section markers on token axis
+    # Section overlays: shade reasoning/patch spans when available, else fall
+    # back to the legacy single-marker vlines.
+    think_ranges = _span_token_ranges(r.char_starts, r.thinking_spans) if r.thinking_spans is not None else None
+    patch_ranges = _span_token_ranges(r.char_starts, r.patch_spans) if r.patch_spans is not None else None
     think_tok = int(np.searchsorted(r.char_ends, r.thinking_end_char)) if r.thinking_end_char > 0 else -1
     patch_tok = int(np.searchsorted(r.char_starts, r.patch_start_char)) if r.patch_start_char > 0 else -1
 
@@ -58,10 +72,16 @@ def plot_timeline(replay_path: Path, out_path: Path) -> None:
     for k, emo in enumerate(r.emotions):
         ax = axes[k // ncol, k % ncol]
         ax.plot(x, scores[:, k], linewidth=0.6, color="steelblue")
-        if think_tok > 0:
-            ax.axvline(think_tok, color="darkorange", linestyle="--", linewidth=0.8, label="</think>")
-        if patch_tok > 0:
-            ax.axvline(patch_tok, color="firebrick", linestyle="--", linewidth=0.8, label="diff start")
+        if think_ranges is not None or patch_ranges is not None:
+            for i, (lo, hi) in enumerate(think_ranges or []):
+                ax.axvspan(lo, hi, color="darkorange", alpha=0.12, label="thinking" if i == 0 else None)
+            for i, (lo, hi) in enumerate(patch_ranges or []):
+                ax.axvspan(lo, hi, color="firebrick", alpha=0.15, label="patch" if i == 0 else None)
+        else:
+            if think_tok > 0:
+                ax.axvline(think_tok, color="darkorange", linestyle="--", linewidth=0.8, label="</think>")
+            if patch_tok > 0:
+                ax.axvline(patch_tok, color="firebrick", linestyle="--", linewidth=0.8, label="diff start")
         ax.set_title(emo, fontsize=9)
         ax.tick_params(labelsize=7)
     # Turn off any unused axes
@@ -114,6 +134,34 @@ def plot_box_by_outcome(per_task_df: pd.DataFrame, out_path: Path, section: str 
     ax.set_title(f"Per-task mean emotion probe score by outcome (section={section})")
     ax.set_xlabel("")
     ax.set_ylabel("probe score (dot product, centered)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Valence composite by outcome
+# ---------------------------------------------------------------------------
+
+def plot_valence_by_outcome(per_task_df: pd.DataFrame, out_path: Path, section: str = "all") -> None:
+    """Box+strip of the per-task negative-valence composite, split by outcome."""
+    val = compute_valence(per_task_df, section)
+    val = val[val["difficulty_bucket"].isin(["easy", "hard"])].dropna(subset=["valence"]).copy()
+    if val.empty:
+        logger.warning("No valence data to plot (section=%s)", section)
+        return
+    val["outcome"] = val["resolved"].map({True: "pass", False: "fail"})
+    val["group"] = val["outcome"] + "-" + val["difficulty_bucket"]
+    order = [g for g in ["pass-easy", "pass-hard", "fail-easy", "fail-hard"] if g in set(val["group"])]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.boxplot(data=val, x="group", y="valence", order=order, ax=ax)
+    sns.stripplot(data=val, x="group", y="valence", order=order, color="black", alpha=0.5, ax=ax)
+    ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_title(f"Per-task negative-valence composite by outcome (section={section})")
+    ax.set_xlabel("")
+    ax.set_ylabel("distress composite (z-scored, higher = more negative)")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)

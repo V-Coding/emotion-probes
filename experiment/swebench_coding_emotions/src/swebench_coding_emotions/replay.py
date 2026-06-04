@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 _THINK_RE = re.compile(r"<think>([\s\S]*?)</think>")
 _PATCH_RE = re.compile(r"diff --git ")
 
+# Span-based markers for multi-turn R2E-agent transcripts. Each turn looks like
+#   Thought:\n\n<think>...reasoning...</think>\nAction:\n\n<function=NAME>...</function>\nObservation:...
+# but the model frequently leaves </think> unclosed (e.g. 52 opens / 11 closes
+# in one task; some tasks never close it), so the single "last </think>" marker
+# above mislabels almost the whole trajectory. We instead bound each turn's
+# reasoning by the reliable Thought: → Action: delimiters.
+_ACTION_RE = re.compile(r"\nAction:")
+_THOUGHT_MARK = "Thought:"
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+# A patch span is a file_editor tool call whose command actually edits a file
+# (the model authoring the fix), as opposed to read-only view/search calls.
+_FILE_EDIT_RE = re.compile(r"<function=file_editor>([\s\S]*?)</function>")
+_EDIT_COMMAND_RE = re.compile(r"<parameter=command>\s*([a-zA-Z_]+)")
+_EDIT_COMMANDS = frozenset({"str_replace", "create", "insert"})
+
 
 @dataclass
 class ReplayResult:
@@ -46,11 +62,15 @@ class ReplayResult:
     emotions: list[str]
     resolved: bool
     difficulty: str
-    thinking_end_char: int      # -1 if no </think> found
-    patch_start_char: int       # -1 if no diff found
+    thinking_end_char: int      # -1 if no </think> found  (legacy single-marker)
+    patch_start_char: int       # -1 if no diff found      (legacy single-marker)
     model_fingerprint: str
     special_token_ids: list[int]  # tokenizer.all_special_ids at replay time
     probe_variant: str            # "denoised" | "augmented" | "raw"
+    # Span-based section markers (char ranges). ``None`` marks a pre-spans replay
+    # file so the analyzer falls back to the legacy single-marker logic above.
+    thinking_spans: list[tuple[int, int]] | None = None
+    patch_spans: list[tuple[int, int]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +147,11 @@ def load_probes(
 # ---------------------------------------------------------------------------
 
 def _find_section_markers(text: str) -> tuple[int, int]:
-    """Return (thinking_end_char, patch_start_char), -1 if absent."""
+    """Return (thinking_end_char, patch_start_char), -1 if absent.
+
+    Legacy single-marker locator, kept for backward-compatibility metadata.
+    Superseded by :func:`_find_section_spans` for the actual section masks.
+    """
     think_end = -1
     think_matches = list(_THINK_RE.finditer(text))
     if think_matches:
@@ -137,6 +161,52 @@ def _find_section_markers(text: str) -> tuple[int, int]:
     if pm is not None:
         patch_start = pm.start()
     return think_end, patch_start
+
+
+def _find_section_spans(
+    text: str,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return (thinking_spans, patch_spans) as lists of ``[start, end)`` char ranges.
+
+    R2E-agent transcripts interleave many turns of
+    ``Thought:\\n<think>...</think>\\nAction:\\n<function=...>...</function>\\nObservation:...``.
+    Two facts make the legacy single-marker split unusable here:
+
+    * The model often forgets to close ``</think>`` (one task: 52 opens / 11
+      closes; two tasks never close it). "Span up to the last ``</think>``"
+      then covers ~the whole trajectory, and how much it covers correlates
+      with the outcome being tested — a confound. We instead bound each turn's
+      reasoning by the reliable ``Thought:`` → ``Action:`` delimiters (closing
+      at ``</think>`` when the model did emit it).
+    * There is no final unified diff (``diff --git`` occurs nowhere); the model
+      edits via ``file_editor`` tool calls. A patch span is each ``file_editor``
+      call whose command actually edits a file (``str_replace`` / ``create`` /
+      ``insert``), i.e. the model authoring the fix.
+
+    ``agent`` is then defined (in analysis) as everything outside both span sets.
+    """
+    thinking: list[tuple[int, int]] = []
+    prev = 0
+    for m in _ACTION_RE.finditer(text):
+        action_start = m.start()
+        seg = text[prev:action_start]
+        tj = seg.rfind(_THOUGHT_MARK)  # this turn's Thought: (closest to Action:)
+        if tj != -1:
+            ti = seg.find(_THINK_OPEN, tj)
+            start = prev + (ti + len(_THINK_OPEN) if ti != -1 else tj + len(_THOUGHT_MARK))
+            ce = seg.rfind(_THINK_CLOSE)  # closed this turn? trim the tag if so
+            end = prev + ce if (ce != -1 and prev + ce > start) else action_start
+            if end > start:
+                thinking.append((start, end))
+        prev = action_start
+
+    patch: list[tuple[int, int]] = []
+    for m in _FILE_EDIT_RE.finditer(text):
+        cmd = _EDIT_COMMAND_RE.search(m.group(1))
+        if cmd is not None and cmd.group(1) in _EDIT_COMMANDS:
+            patch.append((m.start(), m.end()))
+
+    return thinking, patch
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +309,7 @@ def replay_trajectory(
         raise RuntimeError(f"Not all tokens scored for {instance_id} (filled={filled.sum()}/{T})")
 
     think_end, patch_start = _find_section_markers(text)
+    thinking_spans, patch_spans = _find_section_spans(text)
     fingerprint = model_fingerprint or compute_fingerprint(
         model.config.name, model.config.torch_dtype, model.config.quantize, layer
     )
@@ -261,6 +332,8 @@ def replay_trajectory(
         model_fingerprint=fingerprint,
         special_token_ids=special_ids,
         probe_variant=probe_variant,
+        thinking_spans=thinking_spans,
+        patch_spans=patch_spans,
     )
 
 
@@ -290,6 +363,10 @@ def save_replay(result: ReplayResult, path: Path) -> None:
             "model_fingerprint": result.model_fingerprint,
             "special_token_ids": json.dumps(result.special_token_ids),
             "probe_variant": result.probe_variant,
+            "thinking_spans": json.dumps(
+                [list(s) for s in (result.thinking_spans or [])]
+            ),
+            "patch_spans": json.dumps([list(s) for s in (result.patch_spans or [])]),
         },
     )
 
@@ -307,6 +384,18 @@ def read_replay_variant(path: Path) -> str | None:
     except (OSError, ValueError):
         return None
     return meta.get("probe_variant")
+
+
+def _load_spans(meta: dict, key: str) -> list[tuple[int, int]] | None:
+    """Parse a JSON span list from metadata, or None if the key is absent.
+
+    Absent (None) => pre-spans replay file => analysis uses the legacy
+    single-marker logic. Present-but-empty ([]) => span logic with no spans.
+    """
+    raw = meta.get(key)
+    if raw is None:
+        return None
+    return [tuple(s) for s in json.loads(raw)]
 
 
 def load_replay(path: Path) -> ReplayResult:
@@ -333,4 +422,6 @@ def load_replay(path: Path) -> ReplayResult:
         model_fingerprint=meta["model_fingerprint"],
         special_token_ids=special_ids,
         probe_variant=probe_variant,
+        thinking_spans=_load_spans(meta, "thinking_spans"),
+        patch_spans=_load_spans(meta, "patch_spans"),
     )

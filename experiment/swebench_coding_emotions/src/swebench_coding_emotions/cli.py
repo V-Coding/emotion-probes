@@ -331,6 +331,9 @@ def viz(config: str, section: str, variant: str) -> None:
     click.echo("  box_by_outcome.png")
     VZ.plot_box_by_outcome(per_task_df, figures_dir / f"box_by_outcome_{section}.png", section=section)
 
+    click.echo("  valence_by_outcome.png")
+    VZ.plot_valence_by_outcome(per_task_df, figures_dir / f"valence_by_outcome_{section}.png", section=section)
+
     click.echo("  heatmap_tasks.png")
     VZ.plot_task_heatmap(per_task_df, figures_dir / f"heatmap_tasks_{section}.png", section=section)
 

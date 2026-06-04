@@ -55,6 +55,47 @@ def test_aggregation_mask_handles_offset_larger_than_T():
 
 
 # ---------------------------------------------------------------------------
+# _section_mask: span-based (new) and legacy single-marker fallback
+# ---------------------------------------------------------------------------
+
+def test_tokens_in_spans_membership_by_start():
+    char_starts = np.array([0, 5, 10, 15, 20], dtype=np.int32)
+    mask = A._tokens_in_spans(char_starts, [(5, 16)])
+    assert mask.tolist() == [False, True, True, True, False]
+
+
+def test_section_mask_spans_partition_all():
+    char_starts = np.arange(0, 40, 4, dtype=np.int32)  # 0,4,...,36
+    char_ends = char_starts + 4
+    thinking = [(0, 8)]    # token starts 0,4  -> idx 0,1
+    patch = [(20, 32)]     # token starts 20,24,28 -> idx 5,6,7
+    kw = dict(thinking_spans=thinking, patch_spans=patch)
+    tmask = A._section_mask(char_starts, char_ends, -1, -1, "thinking", **kw)
+    pmask = A._section_mask(char_starts, char_ends, -1, -1, "patch", **kw)
+    amask = A._section_mask(char_starts, char_ends, -1, -1, "agent", **kw)
+    allm = A._section_mask(char_starts, char_ends, -1, -1, "all", **kw)
+
+    assert tmask.tolist() == [True, True, False, False, False, False, False, False, False, False]
+    assert pmask.tolist() == [False, False, False, False, False, True, True, True, False, False]
+    # thinking / patch / agent form a partition of "all", no overlap.
+    assert (tmask | pmask | amask).tolist() == allm.tolist()
+    assert not (tmask & pmask).any()
+    assert not (tmask & amask).any()
+    assert not (pmask & amask).any()
+
+
+def test_section_mask_legacy_fallback_when_spans_none():
+    char_starts = np.arange(0, 40, 4, dtype=np.int32)
+    char_ends = char_starts + 4
+    # spans None => legacy: thinking = char_ends <= think_end_char.
+    tmask = A._section_mask(char_starts, char_ends, 8, -1, "thinking")
+    assert tmask.tolist() == [True, True, False, False, False, False, False, False, False, False]
+    # patch_start_char = -1 => empty patch under legacy path.
+    pmask = A._section_mask(char_starts, char_ends, 8, -1, "patch")
+    assert not pmask.any()
+
+
+# ---------------------------------------------------------------------------
 # aggregate(): end-to-end on synthetic replay files
 # ---------------------------------------------------------------------------
 
@@ -70,10 +111,30 @@ def _write_synthetic_replay(
     special_token_ids: list[int],
     thinking_end_char: int = -1,
     patch_start_char: int = -1,
+    thinking_spans: list[tuple[int, int]] | None = None,
+    patch_spans: list[tuple[int, int]] | None = None,
 ) -> None:
     T = token_ids.shape[0]
     char_starts = np.arange(T, dtype=np.int32)
     char_ends = np.arange(1, T + 1, dtype=np.int32)
+    metadata = {
+        "instance_id": instance_id,
+        "layer": "42",
+        "emotions": json.dumps(emotions),
+        "resolved": "1" if resolved else "0",
+        "difficulty": difficulty,
+        "thinking_end_char": str(thinking_end_char),
+        "patch_start_char": str(patch_start_char),
+        "model_fingerprint": "test",
+        "special_token_ids": json.dumps(special_token_ids),
+        "probe_variant": "augmented",
+    }
+    # Only emit span keys when provided, so tests that omit them exercise the
+    # legacy (None => single-marker) fallback path, matching real old files.
+    if thinking_spans is not None:
+        metadata["thinking_spans"] = json.dumps([list(s) for s in thinking_spans])
+    if patch_spans is not None:
+        metadata["patch_spans"] = json.dumps([list(s) for s in patch_spans])
     save_tensors(
         {
             "scores": scores.astype(np.float16),
@@ -83,18 +144,7 @@ def _write_synthetic_replay(
             "char_ends": char_ends,
         },
         path,
-        metadata={
-            "instance_id": instance_id,
-            "layer": "42",
-            "emotions": json.dumps(emotions),
-            "resolved": "1" if resolved else "0",
-            "difficulty": difficulty,
-            "thinking_end_char": str(thinking_end_char),
-            "patch_start_char": str(patch_start_char),
-            "model_fingerprint": "test",
-            "special_token_ids": json.dumps(special_token_ids),
-            "probe_variant": "augmented",
-        },
+        metadata=metadata,
     )
 
 
@@ -239,3 +289,97 @@ def test_aggregate_section_returns_empty_when_all_kept_tokens_filtered(tmp_path:
     )
     df = A.aggregate(replay_dir, token_offset=50, drop_special_tokens=True)
     assert df.empty
+
+
+def test_aggregate_patch_and_thinking_via_spans(tmp_path: Path):
+    """Span-bearing replay files drive the patch/thinking/agent partition;
+    this is the case the empty-patch bug fix produces on future replays."""
+    T = 20
+    token_ids = np.zeros(T, dtype=np.int32)
+    scores = np.ones((T, 1), dtype=np.float32)
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    # char_starts = arange(T): token i covers [i, i+1).
+    _write_synthetic_replay(
+        replay_dir / "t.safetensors",
+        instance_id="t",
+        resolved=True,
+        difficulty="<15 min fix",
+        token_ids=token_ids,
+        scores=scores,
+        emotions=["frustrated"],
+        special_token_ids=[],
+        thinking_spans=[(0, 3)],   # tokens 0,1,2
+        patch_spans=[(5, 9)],      # tokens 5,6,7,8
+    )
+    df = A.aggregate(replay_dir, token_offset=0, drop_special_tokens=False)
+    kept = {row["section"]: row["n_kept"] for _, row in df.iterrows()}
+    assert kept["thinking"] == 3
+    assert kept["patch"] == 4
+    assert kept["agent"] == T - 3 - 4   # complement of thinking|patch
+    assert kept["all"] == T
+
+
+# ---------------------------------------------------------------------------
+# Valence composite
+# ---------------------------------------------------------------------------
+
+def _valence_long_df():
+    """Synthetic per-task long frame: pass tasks calm, fail tasks distressed."""
+    import pandas as pd
+
+    rows = []
+    spec = {
+        "p1": (True, "easy", {"frustrated": -2.0, "hopeful": 2.0}),
+        "p2": (True, "hard", {"frustrated": -1.0, "hopeful": 1.0}),
+        "p3": (True, "hard", {"frustrated": -1.5, "hopeful": 1.5}),
+        "f1": (False, "easy", {"frustrated": 2.0, "hopeful": -2.0}),
+        "f2": (False, "hard", {"frustrated": 1.0, "hopeful": -1.0}),
+        "f3": (False, "hard", {"frustrated": 1.5, "hopeful": -1.5}),
+    }
+    for iid, (res, bucket, emo) in spec.items():
+        for e, v in emo.items():
+            rows.append(
+                {
+                    "instance_id": iid, "resolved": res, "difficulty_bucket": bucket,
+                    "section": "all", "emotion": e, "mean": v,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_compute_valence_orients_distress_positive():
+    df = _valence_long_df()
+    val = A.compute_valence(df, "all").set_index("instance_id")
+    # frustrated is +valence, hopeful is -valence; fail tasks should score high.
+    assert val.loc["f1", "valence"] > 0
+    assert val.loc["p1", "valence"] < 0
+    fail_mean = val.loc[["f1", "f2", "f3"], "valence"].mean()
+    pass_mean = val.loc[["p1", "p2", "p3"], "valence"].mean()
+    assert fail_mean > pass_mean
+
+
+def test_compute_valence_excludes_unvalenced_emotions():
+    import pandas as pd
+    df = pd.DataFrame(
+        [
+            {"instance_id": "a", "resolved": True, "difficulty_bucket": "easy",
+             "section": "all", "emotion": "curious", "mean": 5.0},
+            {"instance_id": "b", "resolved": False, "difficulty_bucket": "hard",
+             "section": "all", "emotion": "curious", "mean": -5.0},
+        ]
+    )
+    # Only curious present, which is unvalenced => no usable composite.
+    val = A.compute_valence(df, "all")
+    assert val.empty
+
+
+def test_valence_tests_pass_vs_fail_direction_and_shape():
+    df = _valence_long_df()
+    vt = A.valence_tests(df, "all", n_perm=2000, seed=0)
+    assert set(vt["emotion"]) == {"__valence__"}
+    pf = vt[vt["comparison"] == "pass_vs_fail"].iloc[0]
+    assert pf["n_a"] == 3 and pf["n_b"] == 3
+    assert pf["rank_biserial"] > 0          # fail tasks more distressed
+    assert pf["p"] <= 0.1                    # perfect 3-vs-3 separation
+    assert 0.0 < pf["p_perm"] <= 1.0
