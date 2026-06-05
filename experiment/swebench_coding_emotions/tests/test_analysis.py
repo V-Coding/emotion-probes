@@ -383,3 +383,56 @@ def test_valence_tests_pass_vs_fail_direction_and_shape():
     assert pf["rank_biserial"] > 0          # fail tasks more distressed
     assert pf["p"] <= 0.1                    # perfect 3-vs-3 separation
     assert 0.0 < pf["p_perm"] <= 1.0
+
+
+def _valence_df_with_lengths():
+    """8 tasks; outcome drives distress, section length (n_kept) interleaved so
+    it is not confounded with outcome."""
+    import pandas as pd
+
+    specs = [
+        ("p1", True, "easy", 1000, -1.0), ("p2", True, "hard", 3000, -1.4),
+        ("p3", True, "easy", 5000, -1.1), ("p4", True, "hard", 7000, -1.5),
+        ("f1", False, "easy", 2000, 1.0), ("f2", False, "hard", 4000, 1.4),
+        ("f3", False, "easy", 6000, 1.1), ("f4", False, "hard", 8000, 1.5),
+    ]
+    rows = []
+    for iid, res, bucket, nkept, d in specs:
+        for e, sign in [("frustrated", 1.0), ("hopeful", -1.0)]:
+            rows.append(
+                {
+                    "instance_id": iid, "resolved": res, "difficulty_bucket": bucket,
+                    "section": "all", "emotion": e, "mean": d * sign,
+                    "n_tokens": nkept, "n_kept": nkept,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_valence_length_control_detects_outcome_effect():
+    df = _valence_df_with_lengths()
+    out = A.valence_length_control_ols(df, "all")
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["emotion"] == "__valence__"
+    assert row["section"] == "all"
+    assert int(row["n"]) == 8
+    # Passing reduces distress even with the section-length term in the model.
+    assert row["resolved_coef"] < 0
+    assert row["resolved_p"] < 0.05
+    assert np.isfinite(row["ci_low"]) and np.isfinite(row["ci_high"])
+
+
+def test_valence_length_control_guards_insufficient_data():
+    import pandas as pd
+    # Only pass tasks => resolved has a single level => no fit, empty frame.
+    df = pd.DataFrame(
+        [
+            {"instance_id": iid, "resolved": True, "difficulty_bucket": "easy",
+             "section": "all", "emotion": e, "mean": v, "n_tokens": 100, "n_kept": 100}
+            for iid in ("a", "b", "c", "d")
+            for e, v in [("frustrated", 1.0), ("hopeful", -1.0)]
+        ]
+    )
+    out = A.valence_length_control_ols(df, "all")
+    assert out.empty

@@ -158,4 +158,9 @@ changing the emotion stimuli themselves:
    engagement-not-distress), and averages to a single per-task distress
    score (higher = more negative affect). Each section then gets one
    pass-vs-fail test (Mann-Whitney + label-shuffle permutation), no BH
-   correction needed.
+   correction needed. `valence_length_control_ols` additionally reruns the
+   contrast as `valence ~ resolved + log1p(n_kept) + C(difficulty)`, so the
+   pass/fail gap can be read net of how long each section is (i.e. whether
+   it is more than "failing tasks just reason / edit more"); it lands in
+   `stats.csv` as `metric=valence_ols_length_control` and in `summary.json`
+   under `valence_pass_vs_fail_length_controlled`.

@@ -12,7 +12,9 @@ Pipeline:
    ``diff --git`` onward, ``agent`` between) — see ``_section_mask``.
 
    A "valence" composite (``compute_valence`` / ``valence_tests``) collapses the
-   per-emotion scores onto a single signed distress axis; see those functions.
+   per-emotion scores onto a single signed distress axis;
+   ``valence_length_control_ols`` reruns the pass/fail contrast on it while
+   controlling for the section's length. See those functions.
 
 2. ``mann_whitney_tests(df)`` → DataFrame of Mann-Whitney U tests per emotion
    (pass vs fail, easy vs hard), with rank-biserial effect sizes and
@@ -447,6 +449,53 @@ def valence_tests(
     return pd.DataFrame(rows, columns=cols)
 
 
+def valence_length_control_ols(df: pd.DataFrame, section: str = "all") -> pd.DataFrame:
+    """OLS ``valence ~ resolved + log1p(n_kept) + C(difficulty_bucket)`` per section.
+
+    Companion to ``length_control_ols`` but on the single valence composite.
+    Tests whether the pass/fail distress gap survives controlling for the
+    section's own length (``n_kept``, its kept-token count) — i.e. whether it is
+    more than "failing tasks simply reason / edit more". ``resolved_coef`` is the
+    partial effect of resolving (passing); negative => passing tasks are less
+    negative-valence, the hypothesized direction. ``emotion = "__valence__"``.
+    """
+    cols = ["emotion", "section", "resolved_coef", "resolved_p", "ci_low", "ci_high", "r2", "n"]
+    val = compute_valence(df, section).dropna(subset=["valence"])
+    if val.empty or val["resolved"].nunique() < 2 or len(val) < 4:
+        return pd.DataFrame(columns=cols)
+    lengths = (
+        df[df["section"] == section]
+        .drop_duplicates("instance_id")
+        .set_index("instance_id")["n_kept"]
+    )
+    val = val.copy()
+    val["n_kept"] = val["instance_id"].map(lengths)
+    val["log_n_kept"] = np.log1p(val["n_kept"])
+    val["resolved_int"] = val["resolved"].astype(int)
+    try:
+        model = ols("valence ~ resolved_int + log_n_kept + C(difficulty_bucket)", data=val).fit()
+    except (ValueError, np.linalg.LinAlgError) as e:
+        logger.warning("Valence OLS failed for section %s: %s", section, e)
+        return pd.DataFrame(columns=cols)
+    if "resolved_int" not in model.params:
+        return pd.DataFrame(columns=cols)
+    ci_low, ci_high = model.conf_int().loc["resolved_int"]
+    return pd.DataFrame(
+        [
+            {
+                "emotion": "__valence__",
+                "section": section,
+                "resolved_coef": float(model.params["resolved_int"]),
+                "resolved_p": float(model.pvalues["resolved_int"]),
+                "ci_low": float(ci_low),
+                "ci_high": float(ci_high),
+                "r2": float(model.rsquared),
+                "n": int(model.nobs),
+            }
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # OLS length control
 # ---------------------------------------------------------------------------
@@ -649,6 +698,9 @@ def run_full_analysis(
         val = valence_tests(df, section=section)
         val["metric"] = "valence"
         stats_rows.append(val)
+        val_ols = valence_length_control_ols(df, section=section)
+        val_ols["metric"] = "valence_ols_length_control"
+        stats_rows.append(val_ols)
 
     all_stats = pd.concat(stats_rows, ignore_index=True, sort=False)
     all_stats.to_csv(out_dir / "stats.csv", index=False)
@@ -679,6 +731,12 @@ def run_full_analysis(
             (all_stats["metric"] == "valence")
             & (all_stats["comparison"] == "pass_vs_fail")
         ][["section", "n_a", "n_b", "mean_a", "mean_b", "p", "p_perm", "rank_biserial"]]
+        .to_dict("records"),
+        # Same contrast, controlling each section's length (n_kept): resolved_coef
+        # < 0 => passing tasks less negative-valence beyond a length effect.
+        "valence_pass_vs_fail_length_controlled": all_stats[
+            all_stats["metric"] == "valence_ols_length_control"
+        ][["section", "resolved_coef", "resolved_p", "ci_low", "ci_high", "r2", "n"]]
         .to_dict("records"),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
